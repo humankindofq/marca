@@ -1,81 +1,124 @@
 <?php
 require_once __DIR__ . '/../config/database.php';
-
 header('Content-Type: application/json');
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    echo json_encode(['success' => false, 'message' => 'Invalid request']);
+    echo json_encode(['success' => false, 'message' => 'Invalid request method']);
     exit;
 }
 
 $data = json_decode(file_get_contents('php://input'), true);
+$errors = [];
 
-if (!isset($data['name'], $data['phone'], $data['cart']) || empty($data['cart'])) {
-    echo json_encode(['success' => false, 'message' => 'Missing required data']);
+// --- СЕРВЕРНАЯ ВАЛИДАЦИЯ ---
+
+// 1. Имя
+$name = isset($data['name']) ? trim($data['name']) : '';
+if (empty($name)) {
+    $errors['name'] = 'Имя обязательно';
+} elseif (!preg_match('/^[а-яёa-z\s-]{2,50}$/iu', $name)) {
+    $errors['name'] = 'Имя должно содержать от 2 до 50 букв';
+}
+
+// 2. Телефон (оставляем только цифры)
+$phone = isset($data['phone']) ? preg_replace('/\D/', '', $data['phone']) : '';
+if (empty($phone)) {
+    $errors['phone'] = 'Телефон обязателен';
+} elseif (strlen($phone) !== 11 || ($phone[0] !== '7' && $phone[0] !== '8')) {
+    $errors['phone'] = 'Некорректный номер телефона';
+} else {
+    $phone = '+7' . substr($phone, 1);
+}
+
+// 3. Email
+$email = isset($data['email']) ? trim($data['email']) : '';
+if (!empty($email) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+    $errors['email'] = 'Некорректный email';
+}
+
+// 4. Адрес
+$address = isset($data['address']) ? trim($data['address']) : '';
+if (empty($address)) {
+    $errors['address'] = 'Введите адрес';
+} elseif (mb_strlen($address) < 5) {
+    $errors['address'] = 'Адрес слишком короткий';
+}
+
+// 5. Комментарий и Корзина
+$comment = isset($data['comment']) ? trim($data['comment']) : '';
+$cart = isset($data['cart']) && is_array($data['cart']) ? $data['cart'] : [];
+if (empty($cart)) {
+    $errors['cart'] = 'Корзина пуста';
+}
+
+// Если есть ошибки - сразу возвращаем их на фронтенд
+if (!empty($errors)) {
+    echo json_encode(['success' => false, 'errors' => $errors]);
     exit;
 }
 
+// --- ОБРАБОТКА ЗАКАЗА ---
 try {
     $pdo = getDBConnection();
     $pdo->beginTransaction();
 
-    // Рассчитываем общую сумму
     $totalAmount = 0;
-    foreach ($data['cart'] as $item) {
-        $totalAmount += $item['price'] * $item['quantity'];
+    $validatedCart = [];
+    
+    // ИСПРАВЛЕНИЕ УЯЗВИМОСТИ: Берем цену из базы данных, а не от пользователя!
+    foreach ($cart as $item) {
+        $stmtPrice = $pdo->prepare("SELECT price FROM products WHERE id = ?");
+        $stmtPrice->execute([$item['product_id']]);
+        $realPrice = $stmtPrice->fetchColumn();
+        
+        if (!$realPrice) {
+            throw new Exception("Товар с ID {$item['product_id']} не найден");
+        }
+        
+        $totalAmount += $realPrice * $item['quantity'];
+        $validatedCart[] = [
+            'product_id' => $item['product_id'],
+            'name' => $item['name'],
+            'quantity' => $item['quantity'],
+            'price' => $realPrice
+        ];
     }
 
-    // Создаем заказ
     $stmt = $pdo->prepare("
-        INSERT INTO orders (customer_name, customer_phone, customer_email, delivery_address, total_amount, comment)
+        INSERT INTO orders (customer_name, customer_phone, customer_email, delivery_address, total_amount, comment) 
         VALUES (?, ?, ?, ?, ?, ?)
     ");
-
-    $stmt->execute([
-        $data['name'],
-        $data['phone'],
-        $data['email'] ?? null,
-        $data['address'] ?? null,
-        $totalAmount,
-        $data['comment'] ?? null
-    ]);
-
+    $stmt->execute([$name, $phone, $email ?: null, $address, $totalAmount, $comment ?: null]);
     $orderId = $pdo->lastInsertId();
 
-    // Добавляем товары заказа
     $stmt = $pdo->prepare("
-        INSERT INTO order_items (order_id, product_id, product_name, quantity, price)
+        INSERT INTO order_items (order_id, product_id, product_name, quantity, price) 
         VALUES (?, ?, ?, ?, ?)
     ");
-
-    foreach ($data['cart'] as $item) {
-        $stmt->execute([
-            $orderId,
-            $item['product_id'],
-            $item['name'],
-            $item['quantity'],
-            $item['price']
-        ]);
+    foreach ($validatedCart as $item) {
+        $stmt->execute([$orderId, $item['product_id'], $item['name'], $item['quantity'], $item['price']]);
     }
 
     $pdo->commit();
 
-    // Отправляем email
-    sendOrderEmail($orderId, $data, $data['cart'], $totalAmount);
+    $cleanData = [
+        'name' => $name, 
+        'phone' => $phone, 
+        'email' => $email, 
+        'address' => $address, 
+        'comment' => $comment
+    ];
 
-    // Отправляем уведомление в Telegram (если настроено)
-    sendTelegramNotification($orderId, $data, $totalAmount);
+    sendOrderEmail($orderId, $cleanData, $validatedCart, $totalAmount);
+    sendTelegramNotification($orderId, $cleanData, $totalAmount);
 
-    // Очищаем корзину
     unset($_SESSION['cart']);
-
     echo json_encode(['success' => true, 'order_id' => $orderId]);
 
 } catch (Exception $e) {
-    if (isset($pdo)) {
-        $pdo->rollBack();
-    }
-    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    if (isset($pdo)) $pdo->rollBack();
+    error_log("Order submit error: " . $e->getMessage());
+    echo json_encode(['success' => false, 'message' => 'Ошибка сервера. Попробуйте позже.']);
 }
 
 function sendOrderEmail($orderId, $data, $cart, $totalAmount) {
@@ -104,38 +147,10 @@ function sendOrderEmail($orderId, $data, $cart, $totalAmount) {
 
     $message .= "\nИтого: " . number_format($totalAmount, 0, '.', ' ') . " ₽";
 
-    // Для локальной разработки просто логируем
     error_log("ORDER EMAIL:\n" . $message);
-
-    // В продакшене раскомментируйте:
-    // mail(ADMIN_EMAIL, $subject, $message);
 }
 
 function sendTelegramNotification($orderId, $data, $totalAmount) {
     // Здесь можно добавить отправку в Telegram через бота
-    // Пример:
-    /*
-    $token = "YOUR_BOT_TOKEN";
-    $chatId = "YOUR_CHAT_ID";
-
-    $message = "🛒 Новый заказ #" . $orderId . "\n";
-    $message .= "👤 " . $data['name'] . "\n";
-    $message .= "📞 " . $data['phone'] . "\n";
-    $message .= "💰 " . number_format($totalAmount, 0, '.', ' ') . " ₽";
-
-    $url = "https://api.telegram.org/bot" . $token . "/sendMessage";
-    $params = [
-        'chat_id' => $chatId,
-        'text' => $message
-    ];
-
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $params);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_exec($ch);
-    curl_close($ch);
-    */
 }
 ?>
