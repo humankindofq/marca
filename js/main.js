@@ -116,7 +116,7 @@ function removeFromCart(productId) {
 }
 
 // Оформление заказа
-function submitOrder(formData) {
+function submitOrder(formData, submitBtn) {
     fetch('/api/submit_order.php', {
         method: 'POST',
         headers: {
@@ -124,19 +124,35 @@ function submitOrder(formData) {
         },
         body: JSON.stringify(formData)
     })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                alert('Заказ успешно оформлен! Мы свяжемся с вами в ближайшее время.');
-                window.location.href = '/';
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('Заказ успешно оформлен! Мы свяжемся с вами в ближайшее время.');
+            window.location.href = '/';
+        } else {
+            // Если бэкенд вернул конкретные ошибки полей
+            if (data.errors) {
+                for (const [field, message] of Object.entries(data.errors)) {
+                    showError(field, message);
+                }
             } else {
-                alert('Ошибка при оформлении заказа: ' + data.message);
+                alert('Ошибка: ' + (data.message || 'Неизвестная ошибка'));
             }
-        })
-        .catch(error => {
-            console.error('Error:', error);
-            alert('Произошла ошибка');
-        });
+            // Возвращаем кнопку
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Оформить заказ';
+            }
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('Произошла ошибка сети. Попробуйте еще раз.');
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Оформить заказ';
+        }
+    });
 }
 
 // Плавная прокрутка
